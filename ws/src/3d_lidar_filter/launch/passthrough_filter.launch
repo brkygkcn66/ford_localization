@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<launch>
+        <node pkg="3d_lidar_filter" type="3d_lidar_filter_node" name="passthrough_filter" output="screen">
+            
+            <param name="input_pc_topic" value="/pointcloud_VLS128_right_pcd" />
+            <param name="filtered_pc_topic" value="/filtered_pc" />
+
+        </node>
+
+</launch>
