@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<launch>
+        <node pkg="scan_matcher" type="scan_matcher_node" name="scan_matcher" output="screen">
+            
+            <param name="target_pc_topic" value="/filtered_pc" />
+            <param name="transformed_pc_topic" value="/transformed_pc" />
+
+        </node>
+
+</launch>
