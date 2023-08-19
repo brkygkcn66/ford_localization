@@ -36,9 +36,14 @@ public:
         // Create a passthrough filter to filter points below a certain z threshold
         pcl::PassThrough<pcl::PointXYZ> pass;
         pass.setInputCloud(input_cloud);
-        pass.setFilterFieldName("z");
-        pass.setFilterLimits(0.8, 5.0); // Set your desired z-axis limits here // 3.52 m lidar yüksekliği + 0.8 m ile 4 m olan azami araç yüksekliği
+        pass.setFilterFieldName("x");
+        pass.setFilterLimits(-30.0, 30.0); // Set your desired z-axis limits here // 3.52 m lidar yüksekliği + 0.8 m ile 4 m olan azami araç yüksekliği
         pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pass.filter(*filtered_cloud);
+
+        pass.setInputCloud(filtered_cloud);
+        pass.setFilterFieldName("y");
+        pass.setFilterLimits(-10.0, 50.0);
         pass.filter(*filtered_cloud);
 
         // Convert filtered PCL point cloud back to ROS PointCloud2 message

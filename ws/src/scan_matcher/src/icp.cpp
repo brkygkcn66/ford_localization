@@ -4,6 +4,25 @@
 #include <pcl_ros/point_cloud.h>
 #include <sensor_msgs/PointCloud2.h>
 
+#include <tf/transform_listener.h>
+#include <tf/transform_broadcaster.h>
+#include <nav_msgs/Odometry.h>
+
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/filters/approximate_voxel_grid.h>
+
+#include <pcl/features/fpfh.h>
+#include <pcl/features/fpfh_omp.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/features/normal_3d_omp.h>
+
+#include <pcl/search/flann_search.h>
+
+#include <pcl/keypoints/iss_3d.h>
+#include <pcl/visualization/pcl_visualizer.h>
+
 class ICPMatcher
 {
     ros::NodeHandle nh_;
@@ -13,15 +32,24 @@ class ICPMatcher
     std::string target_pc_topic;
     std::string transformed_pc_topic;
 
-    int iterations{10};
+    using Point_T = pcl::PointXYZ;
 
-    pcl::PointCloud<pcl::PointXYZ>::Ptr source_cloud{new pcl::PointCloud<pcl::PointXYZ>};
+    pcl::PointCloud<Point_T>::Ptr prev_cloud{new pcl::PointCloud<Point_T>};
+    pcl::PointCloud<Point_T>::Ptr filtered_prev_cloud {new pcl::PointCloud<Point_T>};
+
+    pcl::PointCloud<pcl::FPFHSignature33>::Ptr prev_fpfhs{new pcl::PointCloud<pcl::FPFHSignature33>()};
 
     bool is_first{true};
 
-    Eigen::Matrix4d transformation_matrix = Eigen::Matrix4d::Identity ();
-    Eigen::Matrix4d lidar_odom_matrix = Eigen::Matrix4d::Identity ();
+    ros::Publisher odom_pub;
+    tf::TransformBroadcaster odom_broadcaster;
+    ros::Time current_time;
 
+    Eigen::Matrix4d current_pose;
+
+    pcl::ApproximateVoxelGrid<Point_T> voxel_filter;
+
+    float leaf_size = 0.1;
 
 public:
     ICPMatcher():nh_("~"){
@@ -34,58 +62,296 @@ public:
 
         // Create a publisher for the transformed point cloud
         transformed_pub = nh_.advertise<sensor_msgs::PointCloud2>(
-        transformed_pc_topic, 1);
+        "transformed_pc", 1);
+
+        odom_pub = nh_.advertise<nav_msgs::Odometry>("odom", 50);
+
+        current_pose = Eigen::Matrix4d::Identity ();
     }
 
-    void pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& target_cloud_msg)
+    // This function by Tommaso Cavallari and Federico Tombari, taken from the tutorial
+    // http://pointclouds.org/documentation/tutorials/correspondence_grouping.php
+    double
+    computeCloudResolution(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud)
+    {
+        double resolution = 0.0;
+        int numberOfPoints = 0;
+        int nres;
+        std::vector<int> indices(2);
+        std::vector<float> squaredDistances(2);
+        pcl::search::KdTree<pcl::PointXYZ> tree;
+        tree.setInputCloud(cloud);
+    
+        for (size_t i = 0; i < cloud->size(); ++i)
+        {
+            if (! std::isfinite((*cloud)[i].x))
+                continue;
+    
+            // Considering the second neighbor since the first is the point itself.
+            nres = tree.nearestKSearch(i, 2, indices, squaredDistances);
+            if (nres == 2)
+            {
+                resolution += sqrt(squaredDistances[1]);
+                ++numberOfPoints;
+            }
+        }
+        if (numberOfPoints != 0)
+            resolution /= numberOfPoints;
+    
+        return resolution;
+    }
+    
+    void computeFPFH(pcl::PointCloud<pcl::FPFHSignature33>::Ptr fpfhs, pcl::PointCloud<Point_T>::Ptr cloud)
+    {
+        fpfhs->clear();
+     
+        pcl::PointCloud<pcl::PointXYZ>::Ptr keypoints(new pcl::PointCloud<pcl::PointXYZ>);
+
+        // ISS keypoint detector object.
+        pcl::ISSKeypoint3D<pcl::PointXYZ, pcl::PointXYZ> detector;
+        detector.setInputCloud(cloud);
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr kdtree(new pcl::search::KdTree<pcl::PointXYZ>);
+        detector.setSearchMethod(kdtree);
+        double resolution = computeCloudResolution(cloud);
+        // Set the radius of the spherical neighborhood used to compute the scatter matrix.
+        detector.setSalientRadius(6 * resolution);
+        // Set the radius for the application of the non maxima supression algorithm.
+        detector.setNonMaxRadius(4 * resolution);
+        // Set the minimum number of neighbors that has to be found while applying the non maxima suppression algorithm.
+        detector.setMinNeighbors(5);
+        // Set the upper bound on the ratio between the second and the first eigenvalue.
+        detector.setThreshold21(0.975);
+        // Set the upper bound on the ratio between the third and the second eigenvalue.
+        detector.setThreshold32(0.975);
+        // Set the number of prpcessing threads to use. 0 sets it to automatic.
+        detector.setNumberOfThreads(4);
+    
+        detector.compute(*keypoints);
+
+        ROS_INFO_STREAM("keypoints size    :" << keypoints->size ());
+     
+        // Compute surface normals for the downsampled cloud
+        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+        pcl::NormalEstimationOMP<Point_T, pcl::Normal> normal_estimator;
+        normal_estimator.setInputCloud(keypoints);
+        pcl::search::KdTree<Point_T>::Ptr tree(new pcl::search::KdTree<Point_T>());
+        normal_estimator.setSearchMethod(tree);
+        normal_estimator.setKSearch(10); 
+        normal_estimator.setNumberOfThreads(6);
+        normal_estimator.compute(*normals);
+
+        ROS_INFO_STREAM("cloud_normals size: " << normals->size ());
+
+        // FPFH özellik çıkarımını uygulayın
+        
+        pcl::FPFHEstimationOMP<Point_T, pcl::Normal, pcl::FPFHSignature33> fpfh_estimation;
+        fpfh_estimation.setInputCloud(keypoints);
+        fpfh_estimation.setInputNormals(normals);
+        fpfh_estimation.setSearchMethod(tree);
+        // fpfh_estimation.setRadiusSearch(0.05); 
+        fpfh_estimation.setKSearch(15);
+        fpfh_estimation.setNumberOfThreads(6);
+        fpfh_estimation.compute(*fpfhs);
+
+        ROS_INFO_STREAM("fpfhs size" << fpfhs->size ());
+    }
+    void pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& current_cloud_msg)
     {
         if(is_first)
         {
-            source_cloud->clear();
-            pcl::fromROSMsg(*target_cloud_msg, *source_cloud);
+            
+            pcl::fromROSMsg(*current_cloud_msg, *prev_cloud);
+            
+            voxel_filter.setInputCloud(prev_cloud);
+            voxel_filter.setLeafSize(leaf_size, leaf_size, leaf_size);
+            voxel_filter.filter(*filtered_prev_cloud);
+
+            computeFPFH(prev_fpfhs, filtered_prev_cloud);
+
             is_first = false;
+            // ROS_INFO("First PC Received!!!");
         }
         else
         {
             // Convert ROS PointCloud2 message to PCL point cloud
-            pcl::PointCloud<pcl::PointXYZ>::Ptr target_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-            pcl::fromROSMsg(*target_cloud_msg, *target_cloud);
+            pcl::PointCloud<Point_T>::Ptr current_cloud{new pcl::PointCloud<Point_T>};
+            pcl::fromROSMsg(*current_cloud_msg, *current_cloud);
 
-            // ICP registration
-            pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
-            icp.setInputSource(source_cloud);
-            icp.setInputTarget(target_cloud);
-            icp.setMaximumIterations (iterations);
+            // Apply voxel filter to downsample the point cloud
+            pcl::PointCloud<Point_T>::Ptr filtered_current_cloud {new pcl::PointCloud<Point_T>};
+            voxel_filter.setInputCloud(current_cloud);
+            voxel_filter.setLeafSize(leaf_size, leaf_size, leaf_size); 
+            voxel_filter.filter(*filtered_current_cloud);
+
+            // landmark detection
+
+            pcl::PointCloud<pcl::FPFHSignature33>::Ptr current_fpfhs{new pcl::PointCloud<pcl::FPFHSignature33>()};
+
+            computeFPFH(current_fpfhs, filtered_current_cloud);
+
+            ROS_INFO_STREAM("prev_fpfhs size    :" << prev_fpfhs->size ());
+            ROS_INFO_STREAM("current_fpfhs size :" << current_fpfhs->size ());
+
+
+            // Correspondence estimation
+            pcl::CorrespondencesPtr correspondences{new pcl::Correspondences};
+
+            pcl::registration::CorrespondenceEstimation<pcl::FPFHSignature33, pcl::FPFHSignature33> correspondence_estimation;
+            correspondence_estimation.setInputSource(current_fpfhs);
+            correspondence_estimation.setInputTarget(prev_fpfhs);
+            correspondence_estimation.determineCorrespondences(*correspondences);
+
+            ROS_INFO_STREAM("Correspondence completed!!!");
+
+            // Transformation estimation
+            pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> transform_estimation;
+            Eigen::Matrix4f transformation_matrix;
+            transform_estimation.estimateRigidTransformation(*filtered_current_cloud, *filtered_prev_cloud, *correspondences, transformation_matrix);
+
+            // print4x4Matrix (transformation_matrix.cast<double>());
+
+            // Apply transformation to cloud1
             pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::transformPointCloud(*current_cloud, *transformed_cloud, transformation_matrix);
+
+            // Optionally, refine the alignment using ICP
+            pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+            icp.setInputSource(transformed_cloud);
+            icp.setInputTarget(prev_cloud);
             icp.align(*transformed_cloud);
 
-            if (icp.hasConverged())
+            // Print the transformation matrix and other results
+            std::cout << "Transformation Matrix:\n" << transformation_matrix << std::endl;
+            std::cout << "ICP convergence: " << icp.hasConverged() << ", Score: " << icp.getFitnessScore() << std::endl;
+
+            if(icp.hasConverged())
             {
-                ROS_INFO("ICP converged with score: %f", icp.getFitnessScore());
-
-                transformation_matrix = icp.getFinalTransformation ().cast<double>();
-
-                lidar_odom_matrix = transformation_matrix * lidar_odom_matrix;
-                print4x4Matrix (lidar_odom_matrix);
-
-                // Convert transformed PCL point cloud back to ROS PointCloud2 message
                 sensor_msgs::PointCloud2 transformed_cloud_msg;
                 pcl::toROSMsg(*transformed_cloud, transformed_cloud_msg);
-                transformed_cloud_msg.header = target_cloud_msg->header;
+                transformed_cloud_msg.header = current_cloud_msg->header;
 
                 // Publish the transformed point cloud
                 transformed_pub.publish(transformed_cloud_msg);
             }
-            else
-            {
-                ROS_WARN("ICP did not converge");
-            }
-            // replace source cloud with new cloud
-            source_cloud.swap(target_cloud);
+            
+
+            prev_fpfhs->clear();
+            prev_fpfhs = current_fpfhs;
+
+            // replace previous cloud with new cloud
+            filtered_prev_cloud->clear();
+            filtered_prev_cloud = filtered_current_cloud;
+
+            prev_cloud->clear();
+            prev_cloud = current_cloud;
+
+
+            // // Publish landmarks using ROS publishers
+            // sensor_msgs::PointCloud2 landmarks_msg;
+            // pcl::toROSMsg(*keypoints, landmarks_msg);
+            // landmarks_msg.header.frame_id = "VLS128_right_lidar";
+
+            // keypoints_pub.publish(landmarks_msg);
+
+            // ROS_INFO("4");
+
+            // // ICP registration
+            // pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+            // icp.setInputSource(current_cloud);
+            // icp.setInputTarget(map_ptr);
+            // icp.setMaximumIterations (iterations);
+            // pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_aligned(new pcl::PointCloud<pcl::PointXYZ>);
+            // ROS_INFO("2!");
+            // icp.align(*cloud_aligned);
+
+            // ROS_INFO("3!");
+
+            // if (icp.hasConverged())
+            // {
+            //     ROS_INFO("ICP converged with score: %f", icp.getFitnessScore());
+
+            //     transformation_matrix = icp.getFinalTransformation ().cast<double>();
+
+            //     lidar_odom_matrix = transformation_matrix;
+            //     // print4x4Matrix (transformation_matrix);
+
+            //     // Convert transformed PCL point cloud back to ROS PointCloud2 message
+            //     sensor_msgs::PointCloud2 transformed_cloud_msg;
+            //     pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            //     pcl::transformPointCloud(*current_cloud, *transformed_cloud, transformation_matrix);
+
+            //     map_ptr->clear();
+            //     *map_ptr = *cloud_aligned;
+
+            //     pcl::toROSMsg(*map_ptr, transformed_cloud_msg);
+            //     transformed_cloud_msg.header = current_cloud_msg->header;
+
+            //     // Publish the transformed point cloud
+            //     transformed_pub.publish(transformed_cloud_msg);
+
+            //     // publish_odom(lidar_odom_matrix);
+            // }
+            // else
+            // {
+            //     ROS_ERROR_STREAM("ICP did not converge");
+            // }
+            // // replace source cloud with new cloud
+            // // prev_cloud.swap(current_cloud);
         }
         
     }
 
+    void publish_odom(const Eigen::Matrix4d &matrix)
+    {
+        current_time = ros::Time::now();
+        // Extract the rotation matrix from the transformation
+        Eigen::Matrix3d rotationMatrix = matrix.block<3, 3>(0, 0);
+
+        // Convert the rotation matrix to a quaternion using Eigen
+        Eigen::Quaterniond eigenQuaternion(rotationMatrix);
+
+        // Convert Eigen quaternion to ROS tf2 quaternion
+        geometry_msgs::Quaternion odom_quat;
+        odom_quat.x = eigenQuaternion.x();
+        odom_quat.y = eigenQuaternion.y();
+        odom_quat.z = eigenQuaternion.z();
+        odom_quat.w = eigenQuaternion.w();
+
+        //first, we'll publish the transform over tf
+        geometry_msgs::TransformStamped odom_trans;
+        odom_trans.header.stamp = current_time;
+        odom_trans.header.frame_id = "odom_icp";
+        odom_trans.child_frame_id = "rear_axle";
+
+        odom_trans.transform.translation.x = matrix (0, 3);
+        odom_trans.transform.translation.y = matrix (1, 3);
+        odom_trans.transform.translation.z = matrix (2, 3);
+        odom_trans.transform.rotation = odom_quat;
+
+        //send the transform
+        odom_broadcaster.sendTransform(odom_trans);
+
+        //next, we'll publish the odometry message over ROS
+        nav_msgs::Odometry odom;
+        odom.header.stamp = current_time;
+        odom.header.frame_id = "odom_icp";
+
+        //set the position
+        odom.pose.pose.position.x = matrix (0, 3);
+        odom.pose.pose.position.y = matrix (1, 3);
+        odom.pose.pose.position.z = matrix (2, 3);
+        odom.pose.pose.orientation = odom_quat;
+
+        //set the velocity
+        odom.child_frame_id = "rear_axle";
+        odom.twist.twist.linear.x = 0;
+        odom.twist.twist.linear.y = 0;
+        odom.twist.twist.angular.z = 0;
+
+        //publish the message
+        odom_pub.publish(odom);
+
+    }
 
     void print4x4Matrix (const Eigen::Matrix4d & matrix) const
     {
