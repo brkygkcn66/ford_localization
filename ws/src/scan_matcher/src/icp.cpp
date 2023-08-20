@@ -32,7 +32,8 @@
 using Point_T = pcl::PointXYZ;
 
 // working incrementally
-class GPSOdometryEstimator {
+class GPSOdometryEstimator 
+{
 
 public:
     GPSOdometryEstimator() {
@@ -60,7 +61,7 @@ public:
             diff_displacement = haversineDistance(previous_latitude, previous_longitude, current_latitude, current_longitude);
             
             totol_displacement += diff_displacement;
-            ROS_INFO("Displacement: %.2f meters", totol_displacement);
+            ROS_DEBUG("Displacement: %.2f meters", totol_displacement);
             
             previous_latitude = current_latitude;
             previous_longitude = current_longitude;
@@ -83,11 +84,11 @@ public:
         return R * c;
     }
 
-    double degToRad(double deg) {
+    inline double degToRad(double deg) {
         return deg * (M_PI / 180.0);
     }
 
-    double get_total_distance() const
+    double get_total_displacement() const
     {
         return totol_displacement;
     }
@@ -410,83 +411,83 @@ public:
         
     }
 
-    void publish_odom(const Eigen::Matrix4d &matrix)
-    {
-        current_time = ros::Time::now();
-        // Extract the rotation matrix from the transformation
-        Eigen::Matrix3d rotationMatrix = matrix.block<3, 3>(0, 0);
+//     void publish_odom(const Eigen::Matrix4d &matrix)
+//     {
+//         current_time = ros::Time::now();
+//         // Extract the rotation matrix from the transformation
+//         Eigen::Matrix3d rotationMatrix = matrix.block<3, 3>(0, 0);
 
-        // Convert the rotation matrix to a quaternion using Eigen
-        Eigen::Quaterniond eigenQuaternion(rotationMatrix);
+//         // Convert the rotation matrix to a quaternion using Eigen
+//         Eigen::Quaterniond eigenQuaternion(rotationMatrix);
 
-        // Convert Eigen quaternion to ROS tf2 quaternion
-        geometry_msgs::Quaternion odom_quat;
-        odom_quat.x = eigenQuaternion.x();
-        odom_quat.y = eigenQuaternion.y();
-        odom_quat.z = eigenQuaternion.z();
-        odom_quat.w = eigenQuaternion.w();
+//         // Convert Eigen quaternion to ROS tf2 quaternion
+//         geometry_msgs::Quaternion odom_quat;
+//         odom_quat.x = eigenQuaternion.x();
+//         odom_quat.y = eigenQuaternion.y();
+//         odom_quat.z = eigenQuaternion.z();
+//         odom_quat.w = eigenQuaternion.w();
 
-        //first, we'll publish the transform over tf
-        geometry_msgs::TransformStamped odom_trans;
-        odom_trans.header.stamp = current_time;
-        odom_trans.header.frame_id = "odom_icp";
-        odom_trans.child_frame_id = "rear_axle";
+//         //first, we'll publish the transform over tf
+//         geometry_msgs::TransformStamped odom_trans;
+//         odom_trans.header.stamp = current_time;
+//         odom_trans.header.frame_id = "odom_icp";
+//         odom_trans.child_frame_id = "rear_axle";
 
-        odom_trans.transform.translation.x = matrix (0, 3);
-        odom_trans.transform.translation.y = matrix (1, 3);
-        odom_trans.transform.translation.z = matrix (2, 3);
-        odom_trans.transform.rotation = odom_quat;
+//         odom_trans.transform.translation.x = matrix (0, 3);
+//         odom_trans.transform.translation.y = matrix (1, 3);
+//         odom_trans.transform.translation.z = matrix (2, 3);
+//         odom_trans.transform.rotation = odom_quat;
 
-        //send the transform
-        odom_broadcaster.sendTransform(odom_trans);
+//         //send the transform
+//         odom_broadcaster.sendTransform(odom_trans);
 
-        //next, we'll publish the odometry message over ROS
-        nav_msgs::Odometry odom;
-        odom.header.stamp = current_time;
-        odom.header.frame_id = "odom_icp";
+//         //next, we'll publish the odometry message over ROS
+//         nav_msgs::Odometry odom;
+//         odom.header.stamp = current_time;
+//         odom.header.frame_id = "odom_icp";
 
-        //set the position
-        odom.pose.pose.position.x = matrix (0, 3);
-        odom.pose.pose.position.y = matrix (1, 3);
-        odom.pose.pose.position.z = matrix (2, 3);
-        odom.pose.pose.orientation = odom_quat;
+//         //set the position
+//         odom.pose.pose.position.x = matrix (0, 3);
+//         odom.pose.pose.position.y = matrix (1, 3);
+//         odom.pose.pose.position.z = matrix (2, 3);
+//         odom.pose.pose.orientation = odom_quat;
 
-        //set the velocity
-        odom.child_frame_id = "rear_axle";
-        odom.twist.twist.linear.x = 0;
-        odom.twist.twist.linear.y = 0;
-        odom.twist.twist.angular.z = 0;
+//         //set the velocity
+//         odom.child_frame_id = "rear_axle";
+//         odom.twist.twist.linear.x = 0;
+//         odom.twist.twist.linear.y = 0;
+//         odom.twist.twist.angular.z = 0;
 
-        //publish the message
-        odom_pub.publish(odom);
+//         //publish the message
+//         odom_pub.publish(odom);
 
-    }
+//     }
 
-    void print4x4Matrix (const Eigen::Matrix4d & matrix) const
-    {
-        printf ("Rotation matrix :\n");
-        printf ("    | %6.3f %6.3f %6.3f | \n", matrix (0, 0), matrix (0, 1), matrix (0, 2));
-        printf ("R = | %6.3f %6.3f %6.3f | \n", matrix (1, 0), matrix (1, 1), matrix (1, 2));
-        printf ("    | %6.3f %6.3f %6.3f | \n", matrix (2, 0), matrix (2, 1), matrix (2, 2));
-        printf ("Translation vector :\n");
-        printf ("t = < %6.3f, %6.3f, %6.3f >\n\n", matrix (0, 3), matrix (1, 3), matrix (2, 3));
-    }
+//     void print4x4Matrix (const Eigen::Matrix4d & matrix) const
+//     {
+//         printf ("Rotation matrix :\n");
+//         printf ("    | %6.3f %6.3f %6.3f | \n", matrix (0, 0), matrix (0, 1), matrix (0, 2));
+//         printf ("R = | %6.3f %6.3f %6.3f | \n", matrix (1, 0), matrix (1, 1), matrix (1, 2));
+//         printf ("    | %6.3f %6.3f %6.3f | \n", matrix (2, 0), matrix (2, 1), matrix (2, 2));
+//         printf ("Translation vector :\n");
+//         printf ("t = < %6.3f, %6.3f, %6.3f >\n\n", matrix (0, 3), matrix (1, 3), matrix (2, 3));
+//     }
 
-    void read_params()
-    {
-        if (!nh_.getParam("target_pc_topic", target_pc_topic))
-        {
-            ROS_ERROR_STREAM("Failed to get parameter target_pc_topic");
-        }
-        ROS_INFO_STREAM("target_pc_topic name: " << target_pc_topic);
+//     void read_params()
+//     {
+//         if (!nh_.getParam("target_pc_topic", target_pc_topic))
+//         {
+//             ROS_ERROR_STREAM("Failed to get parameter target_pc_topic");
+//         }
+//         ROS_INFO_STREAM("target_pc_topic name: " << target_pc_topic);
 
-        if (!nh_.getParam("transformed_pc_topic", transformed_pc_topic))
-        {
-            ROS_ERROR_STREAM("Failed to get parameter transformed_pc_topic");
-        }
-        ROS_INFO_STREAM("transformed_pc_topic name: " << transformed_pc_topic);
-    }
-};
+//         if (!nh_.getParam("transformed_pc_topic", transformed_pc_topic))
+//         {
+//             ROS_ERROR_STREAM("Failed to get parameter transformed_pc_topic");
+//         }
+//         ROS_INFO_STREAM("transformed_pc_topic name: " << transformed_pc_topic);
+//     }
+// };
 
 class OdometryEstimator
 {
@@ -544,16 +545,16 @@ public:
     }
 }
 
-class Mapper
-{
-    OdometryEstimator odom_estimator;
+// class Mapper
+// {
+//     OdometryEstimator odom_estimator;
 
     
-}
+// }
 
 class Localization
 {
-
+    ros::NodeHandle nh_;
     // POSE
     geometry_msgs::TransformStamped current_pose_;
     geometry_msgs::TransformStamped prev_pose_;
@@ -565,17 +566,76 @@ class Localization
 
     // TF
     tf2_ros::TransformBroadcaster tf_br;
-    geometry_msgs::TransformStamped pose_trans;
 
+    // POINTCLOUD
     pcl::PointCloud<Point_T>::Ptr map_cloud_{new pcl::PointCloud<Point_T>};
+    pcl::PointCloud<Point_T>::Ptr last_cloud_;
+    ros::Subscriber pc_sub;
+    std::string pc_topic_ = "/pointcloud_VLS128_right_pcd";
+
+    //GPS
+    GPSOdometryEstimator gps_odometry_estimator;
+    double last_displacement{0};
+    double displacement_threshold{10.0};
+
+    // ICP Matcher
+    
 
 public:
-    Localization()
+    Localization():nh_("~")
     {
         initPose();
         pose_pub = nh_.advertise<geometry_msgs::TransformStamped>("pose", 10);
+        pc_sub = nh_.subscribe<sensor_msgs::PointCloud2>(
+            pc_topic_, 1, &Localization::pointCloudCallback, this);
     }
 
+    void pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& current_cloud_msg)
+    {
+        if(map_cloud_->size() == 0)
+        {
+            pcl::fromROSMsg(*current_cloud_msg, *map_cloud_);
+        }
+        else
+        {
+            pcl::PointCloud<Point_T>::Ptr current_cloud{new pcl::PointCloud<Point_T>};
+            pcl::fromROSMsg(*current_cloud_msg, *current_cloud);
+            
+            double diff_disp = propagateWithGPS();
+            if( diff_disp>=displacement_threshold)
+            {
+                last_displacement = total_disp;
+
+                triggerICP(map_cloud_, current_cloud, current_pose_);
+            }
+        }
+
+        publish_pose_and_tf();
+    }
+
+    void triggerICP(const pcl::PointCloud<Point_T>::Ptr map_cloud,
+                    const pcl::PointCloud<Point_T>::Ptr current_cloud,
+                    const geometry_msgs::TransformStamped &current_pose)
+    {
+
+
+    }
+
+    double propagateWithGPS()
+    {
+
+        double total_disp = gps_odometry_estimator.get_total_displacement();
+        double diff_disp = total_disp - last_displacement;
+        translate_pose_on_x_axis(diff_disp);
+        ROS_DEBUG_STREAM("disp: " << diff_disp);
+        return diff_disp;
+    }
+
+    void translate_pose_on_x_axis(double distance)
+    {
+        current_pose_.transform.translation.x += distance;
+    }
+    
     void initPose()
     {
         geometry_msgs::Quaternion odom_quat;
@@ -589,23 +649,19 @@ public:
         current_pose_.transform.translation.z = 0.0;
         current_pose_.transform.rotation = odom_quat;
 
-        current_pose_.header.frame_id = frame_id_
+        current_pose_.header.frame_id = frame_id_;
         current_pose_.child_frame_id = child_frame_id_;
     }
 
-    void publish_tf()
-    {
-        pose_trans.header.stamp = ros::Time::now();
-        tf_br.sendTransform(pose_trans);
-    }
-
-    void publish_pose()
+    void publish_pose_and_tf()
     {
         current_pose_.header.stamp = ros::Time::now();
+        tf_br.sendTransform(current_pose_);
         pose_pub.publish(current_pose_);
     }
 
-}
+};
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "localization_node");
