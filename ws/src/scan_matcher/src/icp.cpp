@@ -23,6 +23,89 @@
 #include <pcl/keypoints/iss_3d.h>
 #include <pcl/visualization/pcl_visualizer.h>
 
+#include <pcl/keypoints/sift_keypoint.h>
+
+#include <ros/ros.h>
+#include <sensor_msgs/NavSatFix.h>
+#include <cmath>
+
+using Point_T = pcl::PointXYZ;
+
+// working incrementally
+class GPSOdometryEstimator {
+
+public:
+    GPSOdometryEstimator() {
+        ros::NodeHandle nh;
+        
+        gps_sub = nh.subscribe("/gps/fix", 10, &GPSOdometryEstimator::gpsCallback, this);
+        
+        previous_latitude = 0.0;
+        previous_longitude = 0.0;
+    }
+
+    void gpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+
+        if(is_first)
+        {
+            previous_latitude = msg->latitude;
+            previous_longitude = msg->longitude;
+            is_first = false;
+        }
+        else
+        {
+            double current_latitude = msg->latitude;
+            double current_longitude = msg->longitude;
+            
+            diff_displacement = haversineDistance(previous_latitude, previous_longitude, current_latitude, current_longitude);
+            
+            totol_displacement += diff_displacement;
+            ROS_INFO("Displacement: %.2f meters", totol_displacement);
+            
+            previous_latitude = current_latitude;
+            previous_longitude = current_longitude;
+        }
+        
+    }
+
+    double haversineDistance(double lat1, double lon1, double lat2, double lon2) {
+        const double R = 6371000.0; // Earth's radius in meters
+        
+        double dlat = degToRad(lat2 - lat1);
+        double dlon = degToRad(lon2 - lon1);
+        
+        double a = std::sin(dlat / 2.0) * std::sin(dlat / 2.0) +
+                   std::cos(degToRad(lat1)) * std::cos(degToRad(lat2)) *
+                   std::sin(dlon / 2.0) * std::sin(dlon / 2.0);
+        
+        double c = 2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
+        
+        return R * c;
+    }
+
+    double degToRad(double deg) {
+        return deg * (M_PI / 180.0);
+    }
+
+    double get_total_distance() const
+    {
+        return totol_displacement;
+    }
+
+    double get_diff_displacement() const
+    {
+        return diff_displacement;
+    }
+
+private:
+    ros::Subscriber gps_sub;
+    double previous_latitude;
+    double previous_longitude;
+    bool is_first{true};
+    double totol_displacement{0};
+    double diff_displacement{0};
+};
+
 class ICPMatcher
 {
     ros::NodeHandle nh_;
@@ -32,12 +115,12 @@ class ICPMatcher
     std::string target_pc_topic;
     std::string transformed_pc_topic;
 
-    using Point_T = pcl::PointXYZ;
-
     pcl::PointCloud<Point_T>::Ptr prev_cloud{new pcl::PointCloud<Point_T>};
     pcl::PointCloud<Point_T>::Ptr filtered_prev_cloud {new pcl::PointCloud<Point_T>};
 
     pcl::PointCloud<pcl::FPFHSignature33>::Ptr prev_fpfhs{new pcl::PointCloud<pcl::FPFHSignature33>()};
+
+    pcl::PointCloud<pcl::PointWithScale>::Ptr keypoints_previous{new pcl::PointCloud<pcl::PointWithScale>};
 
     bool is_first{true};
 
@@ -45,11 +128,17 @@ class ICPMatcher
     tf::TransformBroadcaster odom_broadcaster;
     ros::Time current_time;
 
-    Eigen::Matrix4d current_pose;
+    initial_position_ = Eigen::Vector3f(0, 0, 0);
+    initial_orientation_ = Eigen::Quaternionf(1, 0, 0, 0);
 
     pcl::ApproximateVoxelGrid<Point_T> voxel_filter;
 
-    float leaf_size = 0.1;
+    float leaf_size = 0.25;
+
+    GPSOdometryEstimator gps_odometry_calculator;
+
+    std::string odom_frame_ = "odom_brky";
+    std::string child_frame_ = "rear_axle";
 
 public:
     ICPMatcher():nh_("~"){
@@ -72,14 +161,14 @@ public:
     // This function by Tommaso Cavallari and Federico Tombari, taken from the tutorial
     // http://pointclouds.org/documentation/tutorials/correspondence_grouping.php
     double
-    computeCloudResolution(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud)
+    computeCloudResolution(const pcl::PointCloud<Point_T>::ConstPtr& cloud)
     {
         double resolution = 0.0;
         int numberOfPoints = 0;
         int nres;
         std::vector<int> indices(2);
         std::vector<float> squaredDistances(2);
-        pcl::search::KdTree<pcl::PointXYZ> tree;
+        pcl::search::KdTree<Point_T> tree;
         tree.setInputCloud(cloud);
     
         for (size_t i = 0; i < cloud->size(); ++i)
@@ -101,59 +190,44 @@ public:
         return resolution;
     }
     
-    void computeFPFH(pcl::PointCloud<pcl::FPFHSignature33>::Ptr fpfhs, pcl::PointCloud<Point_T>::Ptr cloud)
+    void computeSIFT(pcl::PointCloud<Point_T>::Ptr cloud_xyz, pcl::PointCloud<pcl::PointWithScale> &keypoints)
     {
-        fpfhs->clear();
-     
-        pcl::PointCloud<pcl::PointXYZ>::Ptr keypoints(new pcl::PointCloud<pcl::PointXYZ>);
-
-        // ISS keypoint detector object.
-        pcl::ISSKeypoint3D<pcl::PointXYZ, pcl::PointXYZ> detector;
-        detector.setInputCloud(cloud);
-        pcl::search::KdTree<pcl::PointXYZ>::Ptr kdtree(new pcl::search::KdTree<pcl::PointXYZ>);
-        detector.setSearchMethod(kdtree);
-        double resolution = computeCloudResolution(cloud);
-        // Set the radius of the spherical neighborhood used to compute the scatter matrix.
-        detector.setSalientRadius(6 * resolution);
-        // Set the radius for the application of the non maxima supression algorithm.
-        detector.setNonMaxRadius(4 * resolution);
-        // Set the minimum number of neighbors that has to be found while applying the non maxima suppression algorithm.
-        detector.setMinNeighbors(5);
-        // Set the upper bound on the ratio between the second and the first eigenvalue.
-        detector.setThreshold21(0.975);
-        // Set the upper bound on the ratio between the third and the second eigenvalue.
-        detector.setThreshold32(0.975);
-        // Set the number of prpcessing threads to use. 0 sets it to automatic.
-        detector.setNumberOfThreads(4);
-    
-        detector.compute(*keypoints);
-
-        ROS_INFO_STREAM("keypoints size    :" << keypoints->size ());
-     
-        // Compute surface normals for the downsampled cloud
-        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
-        pcl::NormalEstimationOMP<Point_T, pcl::Normal> normal_estimator;
-        normal_estimator.setInputCloud(keypoints);
-        pcl::search::KdTree<Point_T>::Ptr tree(new pcl::search::KdTree<Point_T>());
-        normal_estimator.setSearchMethod(tree);
-        normal_estimator.setKSearch(10); 
-        normal_estimator.setNumberOfThreads(6);
-        normal_estimator.compute(*normals);
-
-        ROS_INFO_STREAM("cloud_normals size: " << normals->size ());
-
-        // FPFH özellik çıkarımını uygulayın
+          // Parameters for sift computation
+        constexpr float min_scale = 0.05f;
+        constexpr int n_octaves = 3;
+        constexpr int n_scales_per_octave = 4;
+        constexpr float min_contrast = 0.001f;
         
-        pcl::FPFHEstimationOMP<Point_T, pcl::Normal, pcl::FPFHSignature33> fpfh_estimation;
-        fpfh_estimation.setInputCloud(keypoints);
-        fpfh_estimation.setInputNormals(normals);
-        fpfh_estimation.setSearchMethod(tree);
-        // fpfh_estimation.setRadiusSearch(0.05); 
-        fpfh_estimation.setKSearch(15);
-        fpfh_estimation.setNumberOfThreads(6);
-        fpfh_estimation.compute(*fpfhs);
+        // Estimate the normals of the cloud_xyz
+        pcl::NormalEstimation<pcl::PointXYZ, pcl::PointNormal> ne;
+        pcl::PointCloud<pcl::PointNormal>::Ptr cloud_normals (new pcl::PointCloud<pcl::PointNormal>);
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree_n(new pcl::search::KdTree<pcl::PointXYZ>());
 
-        ROS_INFO_STREAM("fpfhs size" << fpfhs->size ());
+        ne.setInputCloud(cloud_xyz);
+        ne.setSearchMethod(tree_n);
+        ne.setRadiusSearch(0.2);
+        ne.compute(*cloud_normals);
+
+        // Copy the xyz info from cloud_xyz and add it to cloud_normals as the xyz field in PointNormals estimation is zero
+        for(std::size_t i = 0; i<cloud_normals->size(); ++i)
+        {
+            (*cloud_normals)[i].x = (*cloud_xyz)[i].x;
+            (*cloud_normals)[i].y = (*cloud_xyz)[i].y;
+            (*cloud_normals)[i].z = (*cloud_xyz)[i].z;
+        }
+
+        // Estimate the sift interest points using normals values from xyz as the Intensity variants
+        pcl::SIFTKeypoint<pcl::PointNormal, pcl::PointWithScale> sift;
+        
+        pcl::search::KdTree<pcl::PointNormal>::Ptr tree(new pcl::search::KdTree<pcl::PointNormal> ());
+        sift.setSearchMethod(tree);
+        sift.setScales(min_scale, n_octaves, n_scales_per_octave);
+        sift.setMinimumContrast(min_contrast);
+        sift.setInputCloud(cloud_normals);
+        sift.compute(keypoints);
+
+        std::cout << "No of SIFT points in the result are " << keypoints.size () << std::endl;
+     
     }
     void pointCloudCallback(const sensor_msgs::PointCloud2ConstPtr& current_cloud_msg)
     {
@@ -165,8 +239,8 @@ public:
             voxel_filter.setInputCloud(prev_cloud);
             voxel_filter.setLeafSize(leaf_size, leaf_size, leaf_size);
             voxel_filter.filter(*filtered_prev_cloud);
-
-            computeFPFH(prev_fpfhs, filtered_prev_cloud);
+            keypoints_previous->clear();
+            computeSIFT(filtered_prev_cloud, *keypoints_previous);
 
             is_first = false;
             // ROS_INFO("First PC Received!!!");
@@ -185,47 +259,30 @@ public:
 
             // landmark detection
 
-            pcl::PointCloud<pcl::FPFHSignature33>::Ptr current_fpfhs{new pcl::PointCloud<pcl::FPFHSignature33>()};
+            pcl::PointCloud<pcl::PointWithScale>::Ptr keypoints_current{new pcl::PointCloud<pcl::PointWithScale>};
 
-            computeFPFH(current_fpfhs, filtered_current_cloud);
+            computeSIFT(filtered_current_cloud, *keypoints_current);
 
-            ROS_INFO_STREAM("prev_fpfhs size    :" << prev_fpfhs->size ());
-            ROS_INFO_STREAM("current_fpfhs size :" << current_fpfhs->size ());
+            ROS_INFO_STREAM("keypoints_previous size    :" << keypoints_previous->size ());
+            ROS_INFO_STREAM("keypoints_current size :" << keypoints_current->size ());
 
+            pcl::IterativeClosestPoint<pcl::PointWithScale, pcl::PointWithScale> icp;
+            icp.setInputSource(keypoints_previous);
+            icp.setInputTarget(keypoints_current);
 
-            // Correspondence estimation
-            pcl::CorrespondencesPtr correspondences{new pcl::Correspondences};
+            pcl::PointCloud<pcl::PointWithScale> aligned_keypoints;
+            icp.align(aligned_keypoints);
 
-            pcl::registration::CorrespondenceEstimation<pcl::FPFHSignature33, pcl::FPFHSignature33> correspondence_estimation;
-            correspondence_estimation.setInputSource(current_fpfhs);
-            correspondence_estimation.setInputTarget(prev_fpfhs);
-            correspondence_estimation.determineCorrespondences(*correspondences);
-
-            ROS_INFO_STREAM("Correspondence completed!!!");
-
-            // Transformation estimation
-            pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> transform_estimation;
-            Eigen::Matrix4f transformation_matrix;
-            transform_estimation.estimateRigidTransformation(*filtered_current_cloud, *filtered_prev_cloud, *correspondences, transformation_matrix);
-
-            // print4x4Matrix (transformation_matrix.cast<double>());
-
-            // Apply transformation to cloud1
-            pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-            pcl::transformPointCloud(*current_cloud, *transformed_cloud, transformation_matrix);
-
-            // Optionally, refine the alignment using ICP
-            pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
-            icp.setInputSource(transformed_cloud);
-            icp.setInputTarget(prev_cloud);
-            icp.align(*transformed_cloud);
-
-            // Print the transformation matrix and other results
-            std::cout << "Transformation Matrix:\n" << transformation_matrix << std::endl;
-            std::cout << "ICP convergence: " << icp.hasConverged() << ", Score: " << icp.getFitnessScore() << std::endl;
+            
 
             if(icp.hasConverged())
             {
+                Eigen::Matrix4f transformation_matrix = icp.getFinalTransformation();
+                print4x4Matrix (transformation_matrix.cast<double>());
+
+                // Apply transformation to cloud1
+                pcl::PointCloud<Point_T>::Ptr transformed_cloud(new pcl::PointCloud<Point_T>);
+                pcl::transformPointCloud(*current_cloud, *transformed_cloud, transformation_matrix);
                 sensor_msgs::PointCloud2 transformed_cloud_msg;
                 pcl::toROSMsg(*transformed_cloud, transformed_cloud_msg);
                 transformed_cloud_msg.header = current_cloud_msg->header;
@@ -233,10 +290,10 @@ public:
                 // Publish the transformed point cloud
                 transformed_pub.publish(transformed_cloud_msg);
             }
-            
 
-            prev_fpfhs->clear();
-            prev_fpfhs = current_fpfhs;
+
+            keypoints_previous->clear();
+            keypoints_previous = keypoints_current;
 
             // replace previous cloud with new cloud
             filtered_prev_cloud->clear();
@@ -244,6 +301,58 @@ public:
 
             prev_cloud->clear();
             prev_cloud = current_cloud;
+
+            // // Correspondence estimation
+            // pcl::CorrespondencesPtr correspondences{new pcl::Correspondences};
+
+            // pcl::registration::CorrespondenceEstimation<pcl::FPFHSignature33, pcl::FPFHSignature33> correspondence_estimation;
+            // correspondence_estimation.setInputSource(current_fpfhs);
+            // correspondence_estimation.setInputTarget(prev_fpfhs);
+            // correspondence_estimation.determineCorrespondences(*correspondences);
+
+            // ROS_INFO_STREAM("Correspondence completed!!!");
+
+            // // Transformation estimation
+            // pcl::registration::TransformationEstimationSVD<Point_T, Point_T> transform_estimation;
+            // Eigen::Matrix4f transformation_matrix;
+            // transform_estimation.estimateRigidTransformation(*filtered_current_cloud, *filtered_prev_cloud, *correspondences, transformation_matrix);
+
+            // print4x4Matrix (transformation_matrix.cast<double>());
+
+            // // Apply transformation to cloud1
+            // pcl::PointCloud<Point_T>::Ptr transformed_cloud(new pcl::PointCloud<Point_T>);
+            // // pcl::transformPointCloud(*current_cloud, *transformed_cloud, transformation_matrix);
+
+            // // Optionally, refine the alignment using ICP
+            // pcl::IterativeClosestPoint<Point_T, Point_T> icp;
+            // icp.setInputSource(filtered_current_cloud);
+            // icp.setInputTarget(filtered_prev_cloud);
+            // icp.align(*transformed_cloud, transformation_matrix);
+
+            // // Print the transformation matrix and other results
+            // // std::cout << "Transformation Matrix:\n" << transformation_matrix << std::endl;
+            // std::cout << "ICP convergence: " << icp.hasConverged() << ", Score: " << icp.getFitnessScore() << std::endl;
+
+            // if(icp.hasConverged())
+            // {
+            //     sensor_msgs::PointCloud2 transformed_cloud_msg;
+            //     pcl::toROSMsg(*transformed_cloud, transformed_cloud_msg);
+            //     transformed_cloud_msg.header = current_cloud_msg->header;
+
+            //     // Publish the transformed point cloud
+            //     transformed_pub.publish(transformed_cloud_msg);
+            // }
+            
+
+            // prev_fpfhs->clear();
+            // prev_fpfhs = current_fpfhs;
+
+            // // replace previous cloud with new cloud
+            // filtered_prev_cloud->clear();
+            // filtered_prev_cloud = filtered_current_cloud;
+
+            // prev_cloud->clear();
+            // prev_cloud = current_cloud;
 
 
             // // Publish landmarks using ROS publishers
@@ -379,11 +488,129 @@ public:
     }
 };
 
+class OdometryEstimator
+{
+    
+    ros::NodeHandle nh;
+
+    ICPMatcher icp_matcher;
+
+    // FRAMES
+    std::string frame_id_ = "odom_brky";
+    std::string child_frame_id_ = "rear_axle";
+
+    // TF
+    geometry_msgs::TransformStamped odom_trans;
+    tf2_ros::TransformBroadcaster tf_br;
+
+    // ODOM
+    ros::Publisher odom_pub;
+    nav_msgs::Odometry odom;
+    
+public:
+    OdometryEstimator()
+    {   
+        odom_pub = nh.advertise<nav_msgs::Odometry>("odom", 50);
+        initOdomTransaction();
+    }
+
+    void initOdomTransaction()
+    {
+        geometry_msgs::Quaternion odom_quat;
+        odom_quat.x = 0.0;
+        odom_quat.y = 0.0;
+        odom_quat.z = 0.0;
+        odom_quat.w = 1.0;
+
+        odom_trans.transform.translation.x = 0.0;
+        odom_trans.transform.translation.y = 0.0;
+        odom_trans.transform.translation.z = 0.0;
+        odom_trans.transform.rotation = odom_quat;
+
+        odom_trans.header.frame_id = frame_id_
+        odom_trans.child_frame_id = child_frame_id_;
+    }
+
+    void publish_tf()
+    {
+        odom_trans.header.stamp = ros::Time::now();
+        tf_br.sendTransform(odom_trans);
+    }
+
+    void publish_odom()
+    {
+        odom.header.stamp = ros::Time::now();
+        odom_pub.publish(odom);
+    }
+}
+
+class Mapper
+{
+    OdometryEstimator odom_estimator;
+
+    
+}
+
+class Localization
+{
+
+    // POSE
+    geometry_msgs::TransformStamped current_pose_;
+    geometry_msgs::TransformStamped prev_pose_;
+    ros::Publisher pose_pub;
+
+    // FRAMES
+    std::string frame_id_ = "map";
+    std::string child_frame_id_ = "odom_brky";
+
+    // TF
+    tf2_ros::TransformBroadcaster tf_br;
+    geometry_msgs::TransformStamped pose_trans;
+
+    pcl::PointCloud<Point_T>::Ptr map_cloud_{new pcl::PointCloud<Point_T>};
+
+public:
+    Localization()
+    {
+        initPose();
+        pose_pub = nh_.advertise<geometry_msgs::TransformStamped>("pose", 10);
+    }
+
+    void initPose()
+    {
+        geometry_msgs::Quaternion odom_quat;
+        odom_quat.x = 0.0;
+        odom_quat.y = 0.0;
+        odom_quat.z = 0.0;
+        odom_quat.w = 1.0;
+
+        current_pose_.transform.translation.x = 0.0;
+        current_pose_.transform.translation.y = 0.0;
+        current_pose_.transform.translation.z = 0.0;
+        current_pose_.transform.rotation = odom_quat;
+
+        current_pose_.header.frame_id = frame_id_
+        current_pose_.child_frame_id = child_frame_id_;
+    }
+
+    void publish_tf()
+    {
+        pose_trans.header.stamp = ros::Time::now();
+        tf_br.sendTransform(pose_trans);
+    }
+
+    void publish_pose()
+    {
+        current_pose_.header.stamp = ros::Time::now();
+        pose_pub.publish(current_pose_);
+    }
+
+}
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "icp_matcher_node");
+    ros::init(argc, argv, "localization_node");
     
-    ICPMatcher matcher;
+    Localization localization;
 
     ros::spin();
 
